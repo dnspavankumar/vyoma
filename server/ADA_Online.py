@@ -1,100 +1,115 @@
 # server/ADA_Online.py (Revised: Emits moved into functions)
-import asyncio
-import base64
-import torch
-import python_weather
-import asyncio
-# Trying to fix import issues
+# Main ADA AI assistant class that handles conversation, TTS, and various API integrations
+import asyncio  # For asynchronous programming and event loops
+import base64  # For encoding/decoding binary data (audio, images)
+import torch  # PyTorch for machine learning operations
+import python_weather  # Weather API client for location-based weather data
+import asyncio  # Duplicate import for emphasis on async operations
+# Trying to fix import issues with Google's Generative AI library
 try:
-    from google.genai import types
-    from google import genai
+    from google.genai import types  # Google's Generative AI types and schemas
+    from google import genai  # Main Google Generative AI client
     print("Successfully imported google.genai")
 except ImportError as e:
     print(f"Error importing google.genai: {e}")
-    # Fallback imports or mock objects if needed
+    # Fallback imports or mock objects if needed - ensures app works without Google AI
     class MockTypes:
+        """Mock types class to simulate Google AI types when import fails"""
         def __init__(self):
             pass
 
         class GenerateContentConfig:
+            """Mock configuration class for content generation"""
             def __init__(self, system_instruction=None, tools=None):
-                self.system_instruction = system_instruction
-                self.tools = tools
+                self.system_instruction = system_instruction  # System prompt
+                self.tools = tools  # Available tools/functions
 
         class Tool:
+            """Mock tool class for function calling"""
             def __init__(self, function_declarations=None):
-                self.function_declarations = function_declarations
+                self.function_declarations = function_declarations  # Function definitions
 
         class FunctionDeclaration:
+            """Mock function declaration class"""
             def __init__(self, name=None, description=None, parameters=None):
-                self.name = name
-                self.description = description
-                self.parameters = parameters
+                self.name = name  # Function name
+                self.description = description  # Function description
+                self.parameters = parameters  # Function parameters schema
 
         class Schema:
+            """Mock schema class for parameter definitions"""
             def __init__(self, type=None, properties=None, required=None, description=None):
-                self.type = type
-                self.properties = properties
-                self.required = required
-                self.description = description
+                self.type = type  # Data type
+                self.properties = properties  # Object properties
+                self.required = required  # Required fields
+                self.description = description  # Schema description
 
         class Type:
-            OBJECT = "object"
-            STRING = "string"
+            """Mock type constants"""
+            OBJECT = "object"  # Object type constant
+            STRING = "string"  # String type constant
 
     class MockGenAI:
+        """Mock Google AI client for fallback functionality"""
         def __init__(self):
             pass
 
         class Client:
+            """Mock client class"""
             def __init__(self, api_key=None):
-                self.api_key = api_key
-                self.aio = MockAIO()
+                self.api_key = api_key  # API key storage
+                self.aio = MockAIO()  # Async operations interface
 
         class MockAIO:
+            """Mock async interface"""
             def __init__(self):
-                self.chats = MockChats()
+                self.chats = MockChats()  # Chat operations
 
         class MockChats:
+            """Mock chat operations"""
             def create(self, model=None, config=None):
-                return MockChat()
+                return MockChat()  # Return mock chat instance
 
         class MockChat:
+            """Mock chat session"""
             async def send_message(self, content=None):
                 return "This is a mock response as google.genai could not be imported"
 
-    # Use mock objects
+    # Use mock objects when Google AI is unavailable
     types = MockTypes()
     genai = MockGenAI()
     print("Using mock objects for google.genai")
 
-import asyncio
-import googlemaps
-from datetime import datetime
-import os
-from dotenv import load_dotenv
-import websockets
-import json
-from googlesearch import search as Google_Search_sync
-import aiohttp # For async HTTP requests
-from bs4 import BeautifulSoup # For HTML parsing
+# Additional imports for various API integrations
+import asyncio  # Duplicate for emphasis
+import googlemaps  # Google Maps API client for location services
+from datetime import datetime  # Date and time utilities
+import os  # Operating system interface
+from dotenv import load_dotenv  # Environment variable loading
+import websockets  # WebSocket client for real-time communication
+import json  # JSON data handling
+from googlesearch import search as Google_Search_sync  # Synchronous Google search
+import aiohttp # For async HTTP requests to various APIs
+from bs4 import BeautifulSoup # For HTML parsing of web search results
 
-load_dotenv()
+load_dotenv()  # Load environment variables from .env file
 
-ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-MAPS_API_KEY = os.getenv("MAPS_API_KEY")
+# API Keys - Load from environment variables for security
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")  # Text-to-speech API
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")  # Google AI and search APIs
+MAPS_API_KEY = os.getenv("MAPS_API_KEY")  # Google Maps API
 
+# Validate that required API keys are present
 if not ELEVENLABS_API_KEY: print("Error: ELEVENLABS_API_KEY not found.")
 if not GOOGLE_API_KEY: print("Error: GOOGLE_API_KEY not found.")
 if not MAPS_API_KEY: print("Error: MAPS_API_KEY not found.")
 
-
-VOICE_ID = 'Yko7PKHZNXotIFUBG7I9'
-CHANNELS = 1
-RECEIVE_SAMPLE_RATE = 24000
-CHUNK_SIZE = 1024
-MAX_QUEUE_SIZE = 1
+# Audio configuration constants for ElevenLabs TTS
+VOICE_ID = 'Yko7PKHZNXotIFUBG7I9'  # Specific voice ID for ADA's voice
+CHANNELS = 1  # Mono audio output
+RECEIVE_SAMPLE_RATE = 24000  # Audio sample rate in Hz
+CHUNK_SIZE = 1024  # Audio chunk size for streaming
+MAX_QUEUE_SIZE = 1  # Maximum audio queue size to prevent memory issues
 
 MODEL_ID = "eleven_flash_v2_5" # Example model - check latest recommended models
 
