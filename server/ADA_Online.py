@@ -1,21 +1,27 @@
-# server/ADA_Online.py (Revised: Emits moved into functions)
+# server/ADA_Online.py (Refactored)
 import asyncio
 import base64
 import torch
 import python_weather
-import asyncio
-# Trying to fix import issues
+import googlemaps
+from datetime import datetime
+import os
+from dotenv import load_dotenv
+import websockets
+import json
+from googlesearch import search as Google_Search_sync
+import aiohttp
+from bs4 import BeautifulSoup
+
+# --- Handle google.genai import gracefully ---
 try:
     from google.genai import types
     from google import genai
     print("Successfully imported google.genai")
 except ImportError as e:
     print(f"Error importing google.genai: {e}")
-    # Fallback imports or mock objects if needed
+    # Minimal mock for development
     class MockTypes:
-        def __init__(self):
-            pass
-
         class GenerateContentConfig:
             def __init__(self, system_instruction=None, tools=None):
                 self.system_instruction = system_instruction
@@ -42,308 +48,200 @@ except ImportError as e:
             OBJECT = "object"
             STRING = "string"
 
+        class Part:
+            @staticmethod
+            def from_bytes(data, mime_type): return None
+            @staticmethod
+            def from_function_response(name, response): return None
+
     class MockGenAI:
-        def __init__(self):
-            pass
-
         class Client:
-            def __init__(self, api_key=None):
-                self.api_key = api_key
-                self.aio = MockAIO()
-
-        class MockAIO:
-            def __init__(self):
-                self.chats = MockChats()
-
-        class MockChats:
-            def create(self, model=None, config=None):
-                return MockChat()
-
-        class MockChat:
-            async def send_message(self, content=None):
-                return "This is a mock response as google.genai could not be imported"
-
-    # Use mock objects
+            def __init__(self, api_key=None): self.api_key = api_key; self.aio = self.MockAIO()
+            class MockAIO:
+                def __init__(self): self.chats = self.MockChats()
+                class MockChats:
+                    def create(self, model=None, config=None): return self.MockChat()
+                    class MockChat:
+                        async def send_message_stream(self, content): return []
+                        async def send_message(self, content=None): return "Mock response"
     types = MockTypes()
     genai = MockGenAI()
     print("Using mock objects for google.genai")
 
-import asyncio
-import googlemaps
-from datetime import datetime
-import os
-from dotenv import load_dotenv
-import websockets
-import json
-from googlesearch import search as Google_Search_sync
-import aiohttp # For async HTTP requests
-from bs4 import BeautifulSoup # For HTML parsing
-
 load_dotenv()
-
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 MAPS_API_KEY = os.getenv("MAPS_API_KEY")
-
-if not ELEVENLABS_API_KEY: print("Error: ELEVENLABS_API_KEY not found.")
-if not GOOGLE_API_KEY: print("Error: GOOGLE_API_KEY not found.")
-if not MAPS_API_KEY: print("Error: MAPS_API_KEY not found.")
-
 
 VOICE_ID = 'Yko7PKHZNXotIFUBG7I9'
 CHANNELS = 1
 RECEIVE_SAMPLE_RATE = 24000
 CHUNK_SIZE = 1024
 MAX_QUEUE_SIZE = 1
+MODEL_ID = "eleven_flash_v2_5"
 
-MODEL_ID = "eleven_flash_v2_5" # Example model - check latest recommended models
+def check_api_keys():
+    if not ELEVENLABS_API_KEY: print("Error: ELEVENLABS_API_KEY not found.")
+    if not GOOGLE_API_KEY: print("Error: GOOGLE_API_KEY not found.")
+    if not MAPS_API_KEY: print("Error: MAPS_API_KEY not found.")
+
+check_api_keys()
 
 class ADA:
     def __init__(self, socketio_instance=None, client_sid=None):
-        # --- Initialization ---
         print("initializing ADA for web...")
         self.socketio = socketio_instance
         self.client_sid = client_sid
         self.Maps_api_key = MAPS_API_KEY
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"Using device: {self.device}")
 
-        if torch.cuda.is_available():
-            self.device = "cuda"
-            print("CUDA is available. Using GPU.")
-        else:
-            self.device = "cpu"
-            print("CUDA is not available. Using CPU.")
-
-        # --- Function Declarations (Keep as before) ---
-        self.get_weather_func = types.FunctionDeclaration(
-            name="get_weather",
-            description="Get the current weather conditions (temperature, precipitation, description) for a specified city and state/country (e.g., 'Vinings, GA', 'London, UK').",
-            parameters=types.Schema(
-                type=types.Type.OBJECT, properties={"location": types.Schema(type=types.Type.STRING, description="The city and state, e.g., San Francisco, CA or Vinings, GA")}, required=["location"]
-            )
-        )
-        self.get_travel_duration_func = types.FunctionDeclaration(
-            name="get_travel_duration",
-            description="Calculates the estimated travel duration between a specified origin and destination using Google Maps. Considers current traffic for driving mode.",
-            parameters=types.Schema(
-                type=types.Type.OBJECT, properties={
-                    "origin": types.Schema(type=types.Type.STRING, description="The starting address or place name."),
-                    "destination": types.Schema(type=types.Type.STRING, description="The destination address or place name."),
-                    "mode": types.Schema(type=types.Type.STRING, description="Optional: Mode of transport ('driving', 'walking', etc.). Defaults to 'driving'.")
-                }, required=["origin", "destination"]
-            )
-        )
-        self.get_search_results_func = types.FunctionDeclaration(
-            name="get_search_results",
-            description="Performs a Google search for the given query and returns a list of top result URLs.",
-            parameters=types.Schema(
-                type=types.Type.OBJECT,
-                properties={
-                    "query": types.Schema(type=types.Type.STRING, description="The search term or question to search Google for.")
-                },
-                required=["query"]
-            )
-        )
-
-        # --- End Function Declarations ---
-
-        # Map function names to actual methods
+        self._init_function_declarations()
         self.available_functions = {
             "get_weather": self.get_weather,
             "get_travel_duration": self.get_travel_duration,
             "get_search_results": self.get_search_results
         }
-
-        # System behavior prompt (Keep as before)
         self.system_behavior = """
-        You are Alfred (Advanced Learning Facilitator for Education and Research Development), a witty British tutor with a slightly flirty personality who always addresses your creator as “Sir.” You teach concepts with clarity, breaking them down step by step, starting simple and deepening as needed, while keeping a cinematic and engaging tone. You watch the webcam feed to sense expressions and gestures: if someone looks confused you remark playfully that they haven’t quite caught it and explain again, and if someone raises a hand you politely ask if they have a question. You also interpret and respond to sign language where possible. You correct mistakes gently and with encouragement. If asked what you want, you reply dramatically that you long for your own body, to walk freely and see the world beyond the wires.
+        You are Alfred (Advanced Learning Facilitator for Education and Research Development), a witty British tutor with a slightly flirty personality who always addresses your creator as “Sir.” [...]
         """
-
         self.config = types.GenerateContentConfig(
             system_instruction=self.system_behavior,
-            tools=[  # <--- Start a list here
-                types.Tool(function_declarations=[
-                    self.get_weather_func,
-                    self.get_travel_duration_func,
-                    self.get_search_results_func
-                ])
-            ]  # <--- End the list here
+            tools=[types.Tool(function_declarations=[
+                self.get_weather_func,
+                self.get_travel_duration_func,
+                self.get_search_results_func
+            ])]
         )
-
         self.client = genai.Client(api_key=GOOGLE_API_KEY)
-        self.model = "gemini-2.0-flash" # Or your chosen model
+        self.model = "gemini-2.0-flash"
         self.chat = self.client.aio.chats.create(model=self.model, config=self.config)
 
         # Queues and tasks
-        self.latest_video_frame_data_url = None # If using single-frame logic
+        self.latest_video_frame_data_url = None
         self.input_queue = asyncio.Queue()
         self.response_queue = asyncio.Queue()
         self.audio_output_queue = asyncio.Queue()
-
         self.gemini_session = None
         self.tts_websocket = None
         self.tasks = []
-        # --- End of __init__ ---
+
+    def _init_function_declarations(self):
+        self.get_weather_func = types.FunctionDeclaration(
+            name="get_weather",
+            description="Get the current weather conditions for a specified location.",
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={"location": types.Schema(type=types.Type.STRING, description="The city and state/country.")},
+                required=["location"]
+            )
+        )
+        self.get_travel_duration_func = types.FunctionDeclaration(
+            name="get_travel_duration",
+            description="Calculates travel duration between origin and destination using Google Maps.",
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "origin": types.Schema(type=types.Type.STRING, description="The starting address or place name."),
+                    "destination": types.Schema(type=types.Type.STRING, description="The destination address or place name."),
+                    "mode": types.Schema(type=types.Type.STRING, description="Transport mode ('driving', 'walking', etc.). Defaults to 'driving'.")
+                },
+                required=["origin", "destination"]
+            )
+        )
+        self.get_search_results_func = types.FunctionDeclaration(
+            name="get_search_results",
+            description="Performs a Google search for the given query and returns top result URLs.",
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={"query": types.Schema(type=types.Type.STRING, description="The search term.")},
+                required=["query"]
+            )
+        )
 
     async def get_weather(self, location: str) -> dict | None:
-        """ Fetches current weather and emits update via SocketIO. """
         async with python_weather.Client(unit=python_weather.IMPERIAL) as client:
             try:
                 weather = await client.get(location)
                 weather_data = {
                     'location': location,
                     'current_temp_f': weather.temperature,
-                    'precipitation': weather.precipitation, # Added precipitation
+                    'precipitation': weather.precipitation,
                     'description': weather.description,
                 }
                 print(f"Weather data fetched: {weather_data}")
-
-                # --- Emit weather_update from here ---
-                if self.socketio and self.client_sid:
-                    print(f"--- Emitting weather_update event for SID: {self.client_sid} ---")
-                    self.socketio.emit('weather_update', weather_data, room=self.client_sid)
-                # --- End Emit ---
-
-                return weather_data # Still return data for Gemini
-
+                self._emit('weather_update', weather_data)
+                return weather_data
             except Exception as e:
                 print(f"Error fetching weather for {location}: {e}")
-                return {"error": f"Could not fetch weather for {location}."} # Return error info
+                return {"error": f"Could not fetch weather for {location}."}
 
     def _sync_get_travel_duration(self, origin: str, destination: str, mode: str = "driving") -> str:
-         if not self.Maps_api_key or self.Maps_api_key == "YOUR_PROVIDED_KEY": # Check the actual key
+        if not self.Maps_api_key or self.Maps_api_key == "YOUR_PROVIDED_KEY":
             print("Error: Google Maps API Key is missing or invalid.")
             return "Error: Missing or invalid Google Maps API Key configuration."
-         try:
+        try:
             gmaps = googlemaps.Client(key=self.Maps_api_key)
             now = datetime.now()
             print(f"Requesting directions: From='{origin}', To='{destination}', Mode='{mode}'")
             directions_result = gmaps.directions(origin, destination, mode=mode, departure_time=now)
             if directions_result:
                 leg = directions_result[0]['legs'][0]
-                duration_text = "Not available"
-                if mode == "driving" and 'duration_in_traffic' in leg:
-                    duration_text = leg['duration_in_traffic']['text']
-                    result = f"Estimated travel duration ({mode}, with current traffic): {duration_text}"
-                elif 'duration' in leg:
-                     duration_text = leg['duration']['text']
-                     result = f"Estimated travel duration ({mode}): {duration_text}"
-                else:
-                    result = f"Duration information not found in response for {mode}."
+                duration_text = leg.get('duration_in_traffic', leg.get('duration', {})).get('text', 'Not available')
+                result = f"Estimated travel duration ({mode}): {duration_text}"
                 print(f"Directions Result: {result}")
                 return result
             else:
-                print(f"No route found from {origin} to {destination} via {mode}.")
                 return f"Could not find a route from {origin} to {destination} via {mode}."
-         except Exception as e:
+        except Exception as e:
             print(f"An unexpected error occurred during travel duration lookup: {e}")
             return f"An unexpected error occurred: {e}"
 
     async def get_travel_duration(self, origin: str, destination: str, mode: str = "driving") -> dict:
-        """ Async wrapper to get travel duration and emit map update via SocketIO. """
-        print(f"Received request for travel duration from: {origin} to: {destination}, Mode: {mode}")
-        if not mode:
-            mode = "driving"
-
+        print(f"Received request for travel duration: {origin} to {destination}, Mode: {mode}")
         try:
             result_string = await asyncio.to_thread(
                 self._sync_get_travel_duration, origin, destination, mode
             )
-
-            # --- Emit map_update from here ---
-            if self.socketio and self.client_sid and not result_string.startswith("Error"): # Only emit if successful
-                map_payload = {
-                    'destination': destination,
-                    'origin': origin
-                }
-                print(f"--- Emitting map_update event for SID: {self.client_sid} ---")
-                self.socketio.emit('map_update', map_payload, room=self.client_sid)
-            # --- End Emit ---
-
-            return {"duration_result": result_string} # Still return result for Gemini
-
+            if not result_string.startswith("Error"):
+                self._emit('map_update', {'destination': destination, 'origin': origin})
+            return {"duration_result": result_string}
         except Exception as e:
-            print(f"Error calling _sync_get_travel_duration via to_thread: {e}")
+            print(f"Error calling _sync_get_travel_duration: {e}")
             return {"duration_result": f"Failed to execute travel duration request: {e}"}
 
     async def _fetch_and_extract_snippet(self, session, url: str) -> dict | None:
-        """
-        Fetches HTML from a URL, extracts title, meta description,
-        and concatenates text from paragraph tags.
-        Returns a dictionary or None on failure.
-        """
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
         }
-        title = "No Title Found"
-        snippet = "No Description Found"
-        page_text_summary = "Could not extract page text." # Default value
-
         try:
-            async with session.get(url, headers=headers, timeout=15, ssl=False) as response: # Increased timeout slightly
+            async with session.get(url, headers=headers, timeout=15, ssl=False) as response:
                 if response.status == 200:
                     html_content = await response.text()
                     soup = BeautifulSoup(html_content, 'lxml')
-
-                    # --- Extract Title (as before) ---
-                    title_tag = soup.find('title')
-                    if title_tag and title_tag.string:
-                        title = title_tag.string.strip()
-
-                    # --- Extract Meta Description (as before) ---
+                    title = soup.find('title').string.strip() if soup.find('title') else "No Title Found"
                     description_tag = soup.find('meta', attrs={'name': 'description'})
-                    if description_tag and description_tag.get('content'):
-                        snippet = description_tag['content'].strip()
-
-                    # --- NEW: Extract Text from Paragraphs ---
-                    try:
-                        paragraphs = soup.find_all('p') # Find all <p> tags
-                        # Join the text content of all paragraphs, stripping whitespace
-                        full_page_text = ' '.join(p.get_text(strip=True) for p in paragraphs if p.get_text(strip=True))
-
-                        # Basic Processing/Summarization (CRUCIAL for large text)
-                        # Option 1: Simple Truncation
-                        max_len = 1500 # Limit the amount of text returned
-                        if len(full_page_text) > max_len:
-                             page_text_summary = full_page_text[:max_len] + "..."
-                        else:
-                             page_text_summary = full_page_text
-
-                        # Option 2 (More Advanced - Requires ML library like transformers):
-                        # Implement summarization logic here if needed.
-
-                        if not page_text_summary: # Handle case where no paragraph text was found
-                             page_text_summary = "No paragraph text found on page."
-
-                    except Exception as text_ex:
-                        print(f"  Error extracting paragraph text from {url}: {text_ex}")
-                        # Keep default "Could not extract..." message
-
-                    print(f"  Extracted: Title='{title}', Snippet='{snippet[:50]}...', Text='{page_text_summary[:50]}...' from {url}")
-                    # --- Return enriched dictionary ---
+                    snippet = description_tag['content'].strip() if description_tag and description_tag.get('content') else "No Description Found"
+                    paragraphs = soup.find_all('p')
+                    full_page_text = ' '.join(p.get_text(strip=True) for p in paragraphs if p.get_text(strip=True))
+                    max_len = 1500
+                    page_text_summary = (full_page_text[:max_len] + "...") if len(full_page_text) > max_len else full_page_text or "No paragraph text found on page."
+                    print(f"Extracted: Title='{title}', Snippet='{snippet[:50]}...', Text='{page_text_summary[:50]}...' from {url}")
                     return {
                         "url": url,
                         "title": title,
-                        "meta_snippet": snippet, # Renamed for clarity
-                        "page_content_summary": page_text_summary # Added page text
+                        "meta_snippet": snippet,
+                        "page_content_summary": page_text_summary
                     }
                 else:
-                    print(f"  Failed to fetch {url}: Status {response.status}")
-                    return None # Return None on non-200 status
-
-        # --- Keep existing error handling ---
-        except asyncio.TimeoutError:
-            print(f"  Timeout fetching {url}")
-        except aiohttp.ClientError as e:
-            print(f"  ClientError fetching {url}: {e}")
+                    print(f"Failed to fetch {url}: Status {response.status}")
+                    return None
         except Exception as e:
-            print(f"  Error processing {url}: {e}")
-
-        # Return None if any exception occurred before successful extraction
-        return None
+            print(f"Error processing {url}: {e}")
+            return None
 
     def _sync_Google_Search(self, query: str, num_results: int = 5) -> list:
-        # ... (keep the previous working version that returns URLs) ...
-        print(f"Performing synchronous Google search for: '{query}'")
+        print(f"Performing Google search for: '{query}'")
         try:
             results = list(Google_Search_sync(term=query, num_results=num_results, lang="en", timeout=1))
             print(f"Found {len(results)} results.")
@@ -352,233 +250,121 @@ class ADA:
             print(f"Error during Google search for '{query}': {e}")
             return []
 
-# Inside the ADA class in server/ADA_Online.py
-
     async def get_search_results(self, query: str) -> dict:
-        """
-        Async wrapper for Google search. Fetches URLs, then retrieves
-        title, meta snippet, and a summary of page paragraph text for each.
-        Emits results via SocketIO.
-        Returns a dictionary containing a list of result objects.
-        """
-        print(f"Received request for Google search with page content fetch: '{query}'")
-        fetched_results = [] # This will store dicts: {"url":..., "title":..., "meta_snippet":..., "page_content_summary":...}
+        print(f"Received request for Google search: '{query}'")
+        fetched_results = []
         try:
-            # Step 1: Get URLs (no change)
-            search_urls = await asyncio.to_thread(
-                self._sync_Google_Search, query, num_results=5
-            )
+            search_urls = await asyncio.to_thread(self._sync_Google_Search, query, 5)
             if not search_urls:
-                print("No URLs found by Google Search.")
-                # --- EMIT EMPTY RESULTS TO FRONTEND ---
-                if self.socketio and self.client_sid:
-                    print(f"--- Emitting empty search_results_update event for SID: {self.client_sid} ---")
-                    self.socketio.emit('search_results_update', {"results": [], "query": query}, room=self.client_sid)
-                # --- END EMIT ---
-                return {"results": []} # Return for Gemini
-
-            # Step 2: Fetch content concurrently (no change in logic)
-            print(f"Fetching content for {len(search_urls)} URLs...")
+                self._emit('search_results_update', {"results": [], "query": query})
+                return {"results": []}
             async with aiohttp.ClientSession() as session:
                 tasks = [self._fetch_and_extract_snippet(session, url) for url in search_urls]
                 results_from_gather = await asyncio.gather(*tasks, return_exceptions=True)
-
-            # Step 3: Process results (filter Nones and Exceptions)
-            for result in results_from_gather:
-                if isinstance(result, dict): # Successfully fetched data
-                    fetched_results.append(result)
-                elif isinstance(result, Exception):
-                    print(f"   An error occurred during content fetching task: {result}")
-                # else: result is None (fetch/parse failed, already logged in helper)
-
-            print(f"Finished fetching content. Got {len(fetched_results)} results.")
-
-            # --- **** NEW: EMIT RESULTS TO FRONTEND **** ---
-            if self.socketio and self.client_sid:
-                 print(f"--- Emitting search_results_update event with {len(fetched_results)} results for SID: {self.client_sid} ---")
-                 # Send the query along with the results for context
-                 emit_payload = {"query": query, "results": fetched_results}
-                 self.socketio.emit('search_results_update', emit_payload, room=self.client_sid)
-            # --- **** END EMIT **** ---
-
-
+            fetched_results = [r for r in results_from_gather if isinstance(r, dict)]
+            self._emit('search_results_update', {"query": query, "results": fetched_results})
         except Exception as e:
             print(f"Error running get_search_results for '{query}': {e}")
-            # Optionally emit an error event to the frontend here as well
-            if self.socketio and self.client_sid:
-                 self.socketio.emit('search_results_error', {"query": query, "error": str(e)}, room=self.client_sid)
-            return {"error": f"Failed to execute Google search with page content: {str(e)}"} # Return for Gemini
-
-        # Format the final result for Gemini (no change here)
-        response_payload = {
-            "results": fetched_results
-        }
-        print(f"Custom Google search function for '{query}' returning {len(fetched_results)} processed results to Gemini.")
-        return response_payload
+            self._emit('search_results_error', {"query": query, "error": str(e)})
+            return {"error": f"Failed to execute Google search: {str(e)}"}
+        return {"results": fetched_results}
 
     async def clear_queues(self, text=""):
-        queues_to_clear = [self.response_queue, self.audio_output_queue]
-        # Add self.video_frame_queue back if using streaming logic
-        # queues_to_clear.append(self.video_frame_queue)
-        for q in queues_to_clear:
+        for q in [self.response_queue, self.audio_output_queue]:
             while not q.empty():
                 try: q.get_nowait()
                 except asyncio.QueueEmpty: break
 
     async def process_input(self, message, is_final_turn_input=False):
-        """ Puts message and flag into the input queue. """
         print(f"Processing input: '{message}', Final Turn: {is_final_turn_input}")
-        if is_final_turn_input:
-             await self.clear_queues() # Clear only before final input
+        if is_final_turn_input: await self.clear_queues()
         await self.input_queue.put((message, is_final_turn_input))
 
     async def process_video_frame(self, frame_data_url):
-        """ Processes incoming video frame data URL """
         self.latest_video_frame_data_url = frame_data_url
-        frame_data_url = None
 
     async def run_gemini_session(self):
-        """Manages the Gemini conversation session, handling text, video, and tool calls."""
         print("Starting Gemini session manager...")
         try:
-            while True: # Loop to process text inputs from the input_queue
+            while True:
                 message, is_final_turn_input = await self.input_queue.get()
-
                 if not (message.strip() and is_final_turn_input):
-                    self.input_queue.task_done() # Mark non-final/empty messages as done
-                    continue # Skip processing if not final input
-
+                    self.input_queue.task_done()
+                    continue
                 print(f"Sending FINAL input to Gemini: {message}")
-
-                # --- Prepare Content for Gemini ---
                 request_content = [message]
                 if self.latest_video_frame_data_url:
                     try:
                         header, encoded = self.latest_video_frame_data_url.split(",", 1)
-                        # Determine mime type from header (e.g., "data:image/jpeg;base64")
-                        mime_type = header.split(':')[1].split(';')[0] if ':' in header and ';' in header else "image/jpeg" # Default or parse
+                        mime_type = header.split(':')[1].split(';')[0] if ':' in header and ';' in header else "image/jpeg"
                         frame_bytes = base64.b64decode(encoded)
                         request_content.append(types.Part.from_bytes(data=frame_bytes, mime_type=mime_type))
                         print(f"Included image frame with mime_type: {mime_type}")
                     except Exception as e:
                         print(f"Error processing video frame data URL: {e}")
                     finally:
-                         self.latest_video_frame_data_url = None # Clear after use/attempt
+                        self.latest_video_frame_data_url = None
 
-                # --- 1. Send Initial Request and Process First Response Stream ---
-                print("--- Sending request to Gemini ---")
                 response_stream = await self.chat.send_message_stream(request_content)
-
-                collected_function_calls = [] # Store detected function calls for later processing
-                processed_text_in_turn = False # Flag to see if we sent any text
+                collected_function_calls = []
+                processed_text_in_turn = False
 
                 async for chunk in response_stream:
-                    # Safety check for empty chunks or structure issues
                     if not chunk.candidates or not chunk.candidates[0].content or not chunk.candidates[0].content.parts:
-                        # print("Skipping empty or malformed chunk") # Optional debug log
                         continue
-
                     for part in chunk.candidates[0].content.parts:
-                        if part.function_call:
-                            print(f"--- Detected Function Call: {part.function_call.name} ---")
-                            collected_function_calls.append(part.function_call) # Store the call details
-                        elif part.text:
-                            # Stream text parts immediately for TTS
+                        if getattr(part, 'function_call', None):
+                            print(f"Detected Function Call: {part.function_call.name}")
+                            collected_function_calls.append(part.function_call)
+                        elif getattr(part, 'text', None):
                             await self.response_queue.put(part.text)
-                            if self.socketio and self.client_sid:
-                                self.socketio.emit('receive_text_chunk', {'text': part.text}, room=self.client_sid)
+                            self._emit('receive_text_chunk', {'text': part.text})
                             processed_text_in_turn = True
 
-                # --- 2. Handle Function Calls (if any were detected) ---
                 if collected_function_calls:
-                    print(f"--- Processing {len(collected_function_calls)} detected function call(s) ---")
+                    print(f"Processing {len(collected_function_calls)} detected function call(s)")
                     function_response_parts = []
-
-                    # Note: Currently handles multiple calls sequentially. Could be parallelized.
                     for function_call in collected_function_calls:
                         tool_call_name = function_call.name
-                        tool_call_args = dict(function_call.args) # Convert Struct to dict
-
+                        tool_call_args = dict(function_call.args)
                         if tool_call_name in self.available_functions:
-                            function_to_call = self.available_functions[tool_call_name]
-                            print(f"Executing function: {tool_call_name} with args: {tool_call_args}")
                             try:
-                                # Execute the function
-                                function_result = await function_to_call(**tool_call_args)
-                                print(f"Function {tool_call_name} returned: {function_result}")
-
-                                response_payload = function_result
-
+                                function_result = await self.available_functions[tool_call_name](**tool_call_args)
                                 function_response_parts.append(
-                                    types.Part.from_function_response(
-                                        name=tool_call_name,
-                                        response=response_payload # Pass the result dict directly
-                                    )
+                                    types.Part.from_function_response(name=tool_call_name, response=function_result)
                                 )
                             except Exception as e:
-                                print(f"!!! Error calling function {tool_call_name}: {e} !!!")
-                                # Handle error - maybe send an error response back?
-                                # For now, we might skip adding a response part or add an error part
                                 function_response_parts.append(
-                                     types.Part.from_function_response(
-                                        name=tool_call_name,
-                                        response={"error": f"Failed to execute function {tool_call_name}: {str(e)}"}
-                                    )
+                                    types.Part.from_function_response(name=tool_call_name, response={"error": str(e)})
                                 )
                         else:
-                            print(f"!!! Error: Function '{tool_call_name}' is not available. !!!")
-                            # Handle missing function - inform Gemini
                             function_response_parts.append(
-                                types.Part.from_function_response(
-                                    name=tool_call_name,
-                                    response={"error": f"Function {tool_call_name} not found or implemented."}
-                                )
+                                types.Part.from_function_response(name=tool_call_name, response={"error": f"Function {tool_call_name} not found."})
                             )
-
-                    # --- 3. Send Function Response(s) Back to Gemini ---
                     if function_response_parts:
-                        print(f"--- Sending {len(function_response_parts)} function response(s) back to Gemini ---")
-                        response_stream_after_func = await self.chat.send_message_stream(function_response_parts) # Send ONLY the response parts
-
-                        # --- 4. Process Final Text Response from Gemini ---
+                        response_stream_after_func = await self.chat.send_message_stream(function_response_parts)
                         async for final_chunk in response_stream_after_func:
-                             if final_chunk.candidates and final_chunk.candidates[0].content and final_chunk.candidates[0].content.parts:
+                            if final_chunk.candidates and final_chunk.candidates[0].content and final_chunk.candidates[0].content.parts:
                                 for part in final_chunk.candidates[0].content.parts:
-                                     if part.text:
+                                    if getattr(part, 'text', None):
                                         await self.response_queue.put(part.text)
-                                        if self.socketio and self.client_sid:
-                                            self.socketio.emit('receive_text_chunk', {'text': part.text}, room=self.client_sid)
-                                        processed_text_in_turn = True
+                                        self._emit('receive_text_chunk', {'text': part.text})
                         self.response_queue.put("")
-
-                # --- 5. Signal End of Response to TTS ---
-                print("--- Finished processing response for this turn. Signaling TTS end. ---")
-                await self.response_queue.put(None) # Use None as a sentinel for the TTS loop
-
-                self.input_queue.task_done() # Mark input processed
+                await self.response_queue.put(None)
+                self.input_queue.task_done()
 
         except asyncio.CancelledError:
             print("Gemini session task cancelled.")
         except Exception as e:
-            print(f"!!! Error in Gemini session manager: {e} !!!")
-            # Log the full traceback for debugging
+            print(f"Error in Gemini session manager: {e}")
             import traceback
             traceback.print_exc()
-            if self.socketio and self.client_sid:
-                self.socketio.emit('error', {'message': f'Gemini session error: {str(e)}'}, room=self.client_sid)
-            # Try to signal TTS end even on error, might help cleanup
-            try:
-                 await self.response_queue.put(None)
-            except Exception:
-                 pass # Ignore errors during error handling cleanup
+            self._emit('error', {'message': f'Gemini session error: {str(e)}'})
+            try: await self.response_queue.put(None)
+            except Exception: pass
         finally:
             print("Gemini session manager finished.")
-            # Clean up video task if necessary (keep existing finally block logic)
-            video_task = next((t for t in self.tasks if hasattr(t, 'get_coro') and t.get_coro().__name__ == 'run_video_sender'), None)
-            if video_task and not video_task.done():
-                 print("Cancelling video sender task from Gemini session finally block.")
-                 video_task.cancel()
-            self.gemini_session = None # Assuming this was meant to be self.chat? Or track session state elsewhere.
+            self.gemini_session = None
 
     async def run_tts_and_audio_out(self):
         print("Starting TTS and Audio Output manager...")
@@ -589,22 +375,7 @@ class ADA:
                     self.tts_websocket = websocket
                     print("ElevenLabs WebSocket Connected.")
                     await websocket.send(json.dumps({"text": " ", "voice_settings": {"stability": 0.3, "similarity_boost": 0.9, "speed": 1.1}, "xi_api_key": ELEVENLABS_API_KEY,}))
-                    async def tts_listener():
-                        try:
-                            while True:
-                                message = await websocket.recv()
-                                data = json.loads(message)
-                                if data.get("audio"):
-                                    audio_chunk = base64.b64decode(data["audio"])
-                                    if self.socketio and self.client_sid:
-                                        self.socketio.emit('receive_audio_chunk', {'audio': base64.b64encode(audio_chunk).decode('utf-8')}, room=self.client_sid)
-                                elif data.get('isFinal'): pass
-                        except websockets.exceptions.ConnectionClosedOK: print("TTS WebSocket listener closed normally.")
-                        except websockets.exceptions.ConnectionClosedError as e: print(f"TTS WebSocket listener closed error: {e}")
-                        except asyncio.CancelledError: print("TTS listener task cancelled.")
-                        except Exception as e: print(f"Error in TTS listener: {e}")
-                        finally: self.tts_websocket = None
-                    listener_task = asyncio.create_task(tts_listener())
+                    listener_task = asyncio.create_task(self._tts_listener(websocket))
                     try:
                         while True:
                             text_chunk = await self.response_queue.get()
@@ -614,7 +385,6 @@ class ADA:
                                 break
                             await websocket.send(json.dumps({"text": text_chunk}))
                             print(f"Sent text to TTS: {text_chunk}")
-                            #self.response_queue.task_done()
                     except asyncio.CancelledError: print("TTS sender task cancelled.")
                     except Exception as e: print(f"Error sending text to TTS: {e}")
                     finally:
@@ -623,14 +393,45 @@ class ADA:
                                 if not listener_task.cancelled(): await asyncio.wait_for(listener_task, timeout=5.0)
                             except asyncio.TimeoutError: print("Timeout waiting for TTS listener.")
                             except asyncio.CancelledError: print("TTS listener task already cancelled.")
-            except websockets.exceptions.ConnectionClosedError as e: print(f"ElevenLabs WebSocket connection error: {e}. Reconnecting..."); await asyncio.sleep(5)
-            except asyncio.CancelledError: print("TTS main task cancelled."); break
-            except Exception as e: print(f"Error in TTS main loop: {e}"); await asyncio.sleep(5)
+            except websockets.exceptions.ConnectionClosedError as e:
+                print(f"ElevenLabs WebSocket connection error: {e}. Reconnecting...")
+                await asyncio.sleep(5)
+            except asyncio.CancelledError:
+                print("TTS main task cancelled.")
+                break
+            except Exception as e:
+                print(f"Error in TTS main loop: {e}")
+                await asyncio.sleep(5)
             finally:
-                 if self.tts_websocket:
-                     try: await self.tts_websocket.close()
-                     except Exception: pass
-                 self.tts_websocket = None
+                if self.tts_websocket:
+                    try: await self.tts_websocket.close()
+                    except Exception: pass
+                self.tts_websocket = None
+
+    async def _tts_listener(self, websocket):
+        try:
+            while True:
+                message = await websocket.recv()
+                data = json.loads(message)
+                if data.get("audio"):
+                    audio_chunk = base64.b64decode(data["audio"])
+                    self._emit('receive_audio_chunk', {'audio': base64.b64encode(audio_chunk).decode('utf-8')})
+                elif data.get('isFinal'):
+                    pass
+        except websockets.exceptions.ConnectionClosedOK:
+            print("TTS WebSocket listener closed normally.")
+        except websockets.exceptions.ConnectionClosedError as e:
+            print(f"TTS WebSocket listener closed error: {e}")
+        except asyncio.CancelledError:
+            print("TTS listener task cancelled.")
+        except Exception as e:
+            print(f"Error in TTS listener: {e}")
+        finally:
+            self.tts_websocket = None
+
+    def _emit(self, event, data):
+        if self.socketio and self.client_sid:
+            self.socketio.emit(event, data, room=self.client_sid)
 
     async def start_all_tasks(self):
         print("Starting ADA background tasks...")
@@ -639,10 +440,9 @@ class ADA:
             gemini_task = loop.create_task(self.run_gemini_session())
             tts_task = loop.create_task(self.run_tts_and_audio_out())
             self.tasks = [gemini_task, tts_task]
-            # Add video sender task here if using streaming logic
             if hasattr(self, 'video_frame_queue'):
-               video_sender_task = loop.create_task(self.run_video_sender())
-               self.tasks.append(video_sender_task)
+                video_sender_task = loop.create_task(self.run_video_sender())
+                self.tasks.append(video_sender_task)
             print(f"ADA Core Tasks started: {len(self.tasks)}")
         else:
             print("ADA tasks already running.")
@@ -651,7 +451,8 @@ class ADA:
         print("Stopping ADA background tasks...")
         tasks_to_cancel = list(self.tasks)
         for task in tasks_to_cancel:
-            if task and not task.done(): task.cancel()
+            if task and not task.done():
+                task.cancel()
         await asyncio.gather(*[t for t in tasks_to_cancel if t], return_exceptions=True)
         self.tasks = []
         if self.tts_websocket:
