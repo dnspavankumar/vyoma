@@ -1,0 +1,74 @@
+/* src/App.css */
+/* Main application styling with responsive design and dark mode support */
+
+/* Main container for the entire application */
+.app-container {
+  width: 100%;  /* Full width of parent container */
+  max-width: 700px; /* Slightly narrower for better readability */
+  /* Use theme variables for consistent theming */
+  background-color: var(--card-background-light); /* Default light theme background */
+  border-radius: 12px; /* Slightly larger radius for modern look */
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.08); /* Softer shadow for subtle depth */
+  padding: 25px 30px; /* Adjust padding for better spacing */
+  display: flex;  /* Flexbox layout for vertical stacking */
+  flex-direction: column;  /* Stack children vertically */
+  margin: 20px;  /* Outer margin for centering */
+  min-height: calc(100vh - 80px); /* Ensure it takes significant height, accounting for margins */
+  box-sizing: border-box;  /* Include padding in width calculation */
+  }
+  
+  /* Apply dark mode styles based on system preference */
+  @media (prefers-color-scheme: dark) {
+  body:not([data-theme="light"]) .app-container {
+  background-color: var(--card-background-dark);  /* Dark theme background */
+  }
+  }
+  /* Force dark mode when explicitly set */
+  body[data-theme="dark"] .app-container {
+  background-color: var(--card-background-dark);
+  }
+  
+  /* Main heading styling */
+  .app-container h1 {
+  text-align: center;  /* Center the title */
+  color: var(--text-light); /* Use theme variable for consistent colors */
+  margin-bottom: 15px; /* Adjust spacing below title */
+  font-weight: 1000;  /* Bold font weight for emphasis */
+  font-size: 5rem; /* Add this line - Adjust the value as needed for responsive design */
+  }
+  /* Dark mode heading color */
+  @media (prefers-color-scheme: dark) {
+  body:not([data-theme="light"]) .app-container h1 {
+  color: var(--text-dark);  /* Dark theme text color */
+  }
+  }
+  /* Force dark mode heading color */
+  body[data-theme="dark"] .app-container h1 {
+  color: var(--text-dark);
+  }
+  
+  /* Remove chat-wrapper if not needed, structure is in App.jsx */
+  /* .chat-wrapper { ... } */
+  
+  /* Footer styling for copyright and time display */
+  footer {
+  margin-top: auto; /* Push footer to bottom of container */
+  padding-top: 15px;  /* Space above footer content */
+  border-top: 1px solid #eee; /* Keep separator or remove - visual divider */
+  font-size: 0.85em;  /* Smaller font size for secondary information */
+  color: var(--muted-text-light); /* Use variable for muted text color */
+  text-align: center;  /* Center footer content */
+  opacity: 0.8;  /* Slightly transparent for subtle appearance */
+  }
+  /* Dark mode footer styling */
+  @media (prefers-color-scheme: dark) {
+  body:not([data-theme="light"]) footer {
+  border-top-color: #333;  /* Darker border for dark theme */
+  color: var(--muted-text-dark);  /* Dark theme muted text */
+  }
+  }
+  /* Force dark mode footer styling */
+  body[data-theme="dark"] footer {
+  border-top-color: #333;
+  color: var(--muted-text-dark);
+  }
